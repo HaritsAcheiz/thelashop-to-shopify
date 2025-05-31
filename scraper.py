@@ -11,7 +11,8 @@ from html import escape
 import math
 import pandas as pd
 import csv
-from urllib.parse import urlparse, parse_qs, urlunparse
+from urllib.parse import urljoin
+import numpy as np
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -30,26 +31,6 @@ class FTScraper:
 			result = float_wholesaleprice - round(float_wholesaleprice * 5 / 100, 2)
 
 		return f"{result:.2f}"
-
-	def get_fullscale_image_url(self, url):
-		parsed_url = urlparse(url)
-		query_params = parse_qs(parsed_url.query)
-		query_params.pop('width', None)
-
-		new_query = '&'.join(
-			f"{k}={v[0]}" for k, v in query_params.items()
-		)
-
-		result = urlunparse((
-			parsed_url.scheme,
-			parsed_url.netloc,
-			parsed_url.path,
-			parsed_url.params,
-			new_query,
-			parsed_url.fragment
-		))
-
-		return result
 
 	def clean_html(self, html_content):
 		# 1. Remove non-standard attributes that Shopify may not recognize
@@ -85,42 +66,31 @@ class FTScraper:
 	# 		print(product_data_str)
 	# 		return product_data
 
-	# def debug_explode_columns(self, df, columns_to_explode):
-	#     """
-	#     Debug which rows have mismatched lengths when trying to explode multiple columns.
+	def debug_explode_columns(self, df, columns_to_explode):
+		lengths = {}
 
-	#     Args:
-	#         df: pandas DataFrame
-	#         columns_to_explode: list of column names to check
+		# Calculate length of each list in each column
+		for col in columns_to_explode:
+			lengths[f'{col}_length'] = df[col].apply(lambda x: len(x) if isinstance(x, (list, tuple)) else 1)
 
-	#     Returns:
-	#         DataFrame containing problematic rows and their list lengths
-	#     """
-	#     # Create a dict to store lengths of lists in each column
-	#     lengths = {}
+		# Create a DataFrame with the lengths
+		length_df = pd.DataFrame(lengths)
 
-	#     # Calculate length of each list in each column
-	#     for col in columns_to_explode:
-	#         lengths[f'{col}_length'] = df[col].apply(lambda x: len(x) if isinstance(x, (list, tuple)) else 1)
+		# Find rows where lengths don't match
+		first_col_length = length_df.iloc[:, 0]
+		mismatched_mask = False
 
-	#     # Create a DataFrame with the lengths
-	#     length_df = pd.DataFrame(lengths)
+		for col in length_df.columns[1:]:
+			mismatched_mask |= (length_df[col] != first_col_length)
 
-	#     # Find rows where lengths don't match
-	#     first_col_length = length_df.iloc[:, 0]
-	#     mismatched_mask = False
+		# Get problematic rows
+		problem_rows = df[mismatched_mask].copy()
 
-	#     for col in length_df.columns[1:]:
-	#         mismatched_mask |= (length_df[col] != first_col_length)
+		# Add length columns to the output
+		for col, length in lengths.items():
+			problem_rows[col] = length[mismatched_mask]
 
-	#     # Get problematic rows
-	#     problem_rows = df[mismatched_mask].copy()
-
-	#     # Add length columns to the output
-	#     for col, length in lengths.items():
-	#         problem_rows[col] = length[mismatched_mask]
-
-	#     return problem_rows
+		return problem_rows
 
 	def get_product_count(self, url):
 		headers = {
@@ -194,8 +164,6 @@ class FTScraper:
 		# try:
 		cleaned_json_1 = re.sub(r'([{,])\s*(\w+):', r'\1"\2":', json_str)
 		product_data = self.clean_json_string(cleaned_json_1)
-		print('====================================================================')
-		print(product_data)
 
 		extracted_data = {
 			"Product Name": product_data.get("name", ""),
@@ -338,7 +306,8 @@ class FTScraper:
 		logger.info('Getting data from database...')
 		conn = duckdb.connect("thelashop.db")
 		curr = conn.cursor()
-		curr.execute("SELECT url, html FROM product_src LIMIT 1 OFFSET 10")
+		curr.execute("SELECT url, html FROM product_src")
+		# curr.execute("SELECT url, html FROM product_src WHERE url='https://thelashop.com/products/25-ft-aluminum-telescoping-flagpole-kit-with-us-flag'")
 		datas = curr.fetchall()
 		product_datas = list()
 
@@ -354,10 +323,6 @@ class FTScraper:
 			script_tags = tree.css('script')
 			script_content = None
 
-			# for script in script_tags:
-			# 	print('=========================================================')
-			# 	print(script.text())
-
 			for script in script_tags:
 				if 'inventory_quantity' in script.text():
 					script_content = script.text()
@@ -372,10 +337,6 @@ class FTScraper:
 			if script_content:
 				product_data = self.extract_product_data(script_content)
 
-			print(product_var)
-			print('========================================================================')
-			print(product_data)
-
 			current_product['Handle'] = data[0].split('/')[-1]
 			current_product['Title'] = product_data['Product Name']
 			current_product['Body (HTML)'] = self.clean_html(tree.css_first('div.pg__tabs > div > div > div').html)
@@ -385,14 +346,19 @@ class FTScraper:
 			current_product['Product Category'] = ' > '.join(breadcrumb_list[1:-1])
 			current_product['Type'] = breadcrumb_list[-1]
 			current_product['Tags'] = ', '.join(breadcrumb_list[1:-1])
-			# product_elem = tree.css_first('div#shopify-section-pr_summary')
-			option_label = tree.css_first('span.spr_variant-label')
-			if not option_label:
+			option_labels = tree.css('span.pg__option-sub__label')
+			if not option_labels:
 				pass
-			if option_label:
-				current_product['Option1 Name'] = option_label.text(strip=True).split(':')[0]
-			image_elements = tree.css('img.img-abs.pg__img--auto-ratio')
-			image_srcs = [elem.attrs['src'] for elem in image_elements]
+			if option_labels:
+				for i, opt in enumerate(option_labels):
+					if i == 0:
+						current_product['Option1 Name'] = opt.text(strip=True).split(':')[0]
+					elif i == 1:
+						current_product['Option2 Name'] = opt.text(strip=True).split(':')[0]
+					else:
+						current_product['Option3 Name'] = opt.text(strip=True).split(':')[0]
+			image_elements = tree.css('div.pg__main > a')
+			image_paths = [elem.attrs['href'] for elem in image_elements]
 
 			option1_values = list()
 			option2_values = list()
@@ -401,96 +367,103 @@ class FTScraper:
 			variant_weight = list()
 			variant_qty = list()
 			variant_cost = list()
+			variant_compare_at_price = list()
 			variant_image = list()
 			variant_requires_shipping = list()
 			variant_taxable = list()
 
 			variant_list = list(product_var.values())
-			print('=========================================================')
-			print(variant_list)
 			for variant in variant_list:
 				if current_product['Option1 Name'] != '':
 					if variant['options'] != 'None':
-						option1_values.extend(variant['options'])
+						option1_values.append(variant['options'][0])
 				else:
 					option1_values = ''
-		# 		if current_product['Option2 Name'] != '':
-		# 			if variant['option2'] != 'None':
-		# 				option2_values.append(variant['option2'])
-		# 		else:
-		# 			option2_values = ''
+				if current_product['Option2 Name'] != '':
+					if variant['options'] != 'None':
+						option2_values.append(variant['options'][1])
+				else:
+					option2_values = ''
 
-		# 		if current_product['Option3 Name'] != '':
-		# 			if variant['option3'] != 'None':
-		# 				option3_values.append(variant['option3'])
-		# 		else:
-		# 			option3_values = ''
+				if current_product['Option3 Name'] != '':
+					if variant['options'] != 'None':
+						option3_values.append(variant['options'][2])
+				else:
+					option3_values = ''
 
 				variant_skus.append(variant['sku'])
 				variant_weight.append('')
 				variant_qty.append(10 if variant['inventory_quantity'] > 0 else 0)
-		# 		variant_cost.append(variant['Price'])
-		# 		try:
-		# 			variant_image.append(f"https:{variant['Image Src']}")
-		# 		except Exception:
-		# 			variant_image.append('')
-		# 		variant_requires_shipping.append(True)
-		# 		variant_taxable.append(True)
+				variant_cost.append(round(variant['price'] / 100, 2))
+				try:
+					variant_image.append(f"https:{variant['featured_media']['src']}")
+				except Exception:
+					variant_image.append('')
+				variant_requires_shipping.append(True)
+				variant_taxable.append(True)
+				variant_compare_at_price.append(variant['compare_at_price'])
 
 			current_product['Option1 Value'] = option1_values
-		# 	current_product['Option2 Value'] = option2_values
-		# 	current_product['Option3 Value'] = option3_values
+			current_product['Option2 Value'] = option2_values
+			current_product['Option3 Value'] = option3_values
 			current_product['Variant SKU'] = variant_skus
 			current_product['Variant Grams'] = variant_weight
 			current_product['Variant Inventory Qty'] = variant_qty
-		# 	current_product['Google Shopping / Custom Label 0'] = 'YCU'
-		# 	current_product['Variant Image'] = variant_image
-		# 	current_product['Cost per item'] = variant_cost
-		# 	current_product['Variant Price'] = [self.get_price(x) for x in variant_cost]
-		# 	current_product['Variant Compare At Price'] = ''
-		# 	current_product['Variant Requires Shipping'] = variant_requires_shipping
-		# 	current_product['Variant Taxable'] = variant_taxable
-		# 	try:
-		# 		current_product['Image Src'] = [self.get_fullscale_image_url(f'https:{url}') for url in image_srcs]
-		# 		current_product['Image Alt Text'] = [url.split('/')[-1].split('?')[0] for url in image_srcs]
-		# 	except KeyError:
-		# 		pass
+			current_product['Google Shopping / Custom Label 0'] = 'TLS'
+			current_product['Variant Image'] = variant_image
+			current_product['Cost per item'] = variant_cost
+			current_product['Variant Price'] = [self.get_price(x) for x in variant_cost]
+			current_product['Variant Compare At Price'] = [round(x / 100, 2) if x is not None else '' for x in variant_compare_at_price]
+			current_product['Variant Requires Shipping'] = variant_requires_shipping
+			current_product['Variant Taxable'] = variant_taxable
+			try:
+				current_product['Image Src'] = [f'https:{path}' for path in image_paths]
+				current_product['Image Alt Text'] = [url.split('/')[-1].split('?')[0] for url in image_paths]
+			except KeyError as e:
+				print(e)
+				pass
 
-		print('==========================================================')
-		print(current_product)
-		# 	product_datas.append(current_product)
+			product_datas.append(current_product)
 
-		# df = pd.DataFrame.from_records(product_datas)
+		df = pd.DataFrame.from_records(product_datas)
 
-		# logger.info('Data Extracted!')
+		logger.info('Data Extracted!')
 
-		# return df
+		return df
 
 	def transform_product_datas(self, df):
-		# try:
-		# First check for problematic rows
 		# problems = self.debug_explode_columns(df, [
-		# 	'Option1 Value', 'Variant SKU', 'Variant Grams', 'Variant Inventory Qty',
-		#     'Variant Price', 'Variant Requires Shipping', 'Variant Taxable', 'Variant Image',
-		#     'Cost per item'
+		# 	'Option2 Value', 'Variant SKU', 'Variant Grams', 'Variant Inventory Qty',
+		# 	'Variant Price', 'Variant Requires Shipping', 'Variant Taxable', 'Variant Image',
+		# 	'Cost per item'
 		# ])
 
 		# if len(problems) > 0:
-		#     print("Found problematic rows:")
-		#     print(problems[[
-		#         'Handle', 'Option1 Name', 'Option1 Value', 'Variant SKU'
-		#     ]])
+		# 	print("Found problematic rows:")
+		# 	print(problems[['Handle', 'Option2 Name', 'Option2 Value', 'Variant SKU']])
 		# else:
-		# If no problems found, proceed with explode
 
-		df = df.explode([
+		df1opt = df[df['Option2 Value'].isin([np.nan, ''])]
+
+		df1opt = df1opt.explode([
 			'Option1 Value', 'Variant SKU', 'Variant Grams', 'Variant Inventory Qty',
 			'Variant Price', 'Variant Requires Shipping', 'Variant Taxable', 'Variant Image',
-			'Cost per item'
+			'Cost per item', 'Variant Compare At Price'
 		],
 			ignore_index=True
 		)
 
+		df2opt = df[~df['Option2 Value'].isin([np.nan, ''])]
+
+		df2opt = df2opt.explode([
+			'Option1 Value', 'Option2 Value', 'Variant SKU', 'Variant Grams', 'Variant Inventory Qty',
+			'Variant Price', 'Variant Requires Shipping', 'Variant Taxable', 'Variant Image',
+			'Cost per item', 'Variant Compare At Price'
+		],
+			ignore_index=True
+		)
+
+		df = pd.concat([df1opt, df2opt])
 		with open('variant_unused_columns.csv', 'r') as file:
 			rows = csv.reader(file)
 			variant_unused_columns = [row[0] for row in rows]
